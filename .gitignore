@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+# Messdaten-Aufzeichnungen nicht versionieren
+*.csv
