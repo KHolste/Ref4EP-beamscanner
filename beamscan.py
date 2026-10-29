@@ -1,5 +1,5 @@
 """
-Steuerung der z-Verfahreinheit ueber eine NI PCIe-6321.
+Beamscan: Steuerung der Linearachse (z, im Vakuum) ueber eine NI PCIe-6321.
 
 Hardware:
   * ao0  -> Relais "HOCH"   (Motor faehrt nach oben)
@@ -23,7 +23,7 @@ Sicherheitskonzept:
     Grenze abgeschaltet (sofern die Messung laeuft).
   * NOT-AUS sowie Trennen/Programmende setzen beide Ausgaenge auf 0 V.
 
-Start:  python ao_control.py
+Start:  python beamscan.py
 """
 
 from __future__ import annotations
