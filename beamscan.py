@@ -18,9 +18,9 @@ Sicherheitskonzept:
   * ai0 wird fest differentiell im Bereich +/-10 V gemessen.
   * HOCH und RUNTER koennen nie gleichzeitig aktiv sein (Verriegelung in
     der GUI und zusaetzlich direkt vor dem Schreiben auf die Hardware).
-  * HOCH ist nur bei laufender Positionsmessung moeglich und wird an der
-    oberen Grenze automatisch abgeschaltet. RUNTER wird an der unteren
-    Grenze abgeschaltet (sofern die Messung laeuft).
+  * Bei laufender Positionsmessung wird HOCH an der oberen und RUNTER an
+    der unteren Grenze automatisch abgeschaltet. Ohne Messung gibt es oben
+    keinen automatischen Stopp ("Ganz nach oben" braucht daher die Messung).
   * NOT-AUS sowie Trennen/Programmende setzen beide Ausgaenge auf 0 V.
 
 Start:  python beamscan.py
@@ -28,6 +28,7 @@ Start:  python beamscan.py
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import time
@@ -39,7 +40,8 @@ from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
     QGridLayout,
-    QGroupBox, QHBoxLayout, QLabel, QMessageBox, QPlainTextEdit,
+    QGroupBox, QHBoxLayout, QInputDialog, QLabel, QMessageBox,
+    QPlainTextEdit,
     QPushButton, QSpinBox, QVBoxLayout, QWidget,
 )
 
@@ -71,11 +73,14 @@ AI_KANAL = "ai0"
 AI_BEREICH = 10.0                       # V, fester Messbereich +/-10 V (Poti -4,5...+4,9 V)
 AI_ABTASTRATE = 10000.0                 # Hz, nur bei Mittelung > 1 Sample
 # Zeitfenster der Trendkurve (Anzeige, Sekunden)
+SEIT_MESSBEGINN = 0         # Zeitfenster-Wert: alles seit "Messung starten"
 ZEITFENSTER = [("1 min", 60), ("5 min", 300), ("15 min", 900),
-               ("30 min", 1800), ("1 h", 3600), ("ganzer Tag (24 h)", 86400)]
+               ("30 min", 1800), ("1 h", 3600),
+               ("seit Beginn der Messung", SEIT_MESSBEGINN)]
 VERLAUF_FEIN_S = 3600       # jeder Messpunkt wird 1 h lang gespeichert
-VERLAUF_GROB_S = 86400      # ausgeduennter Verlauf fuer den ganzen Tag
+VERLAUF_GROB_S = 7 * 86400  # ausgeduennter Verlauf, max. 7 Tage
 VERLAUF_GROB_RASTER = 10.0  # s, ein Punkt je 10 s im groben Verlauf
+Z_ANSICHT = (-2.0, 94.0)    # mm, Standard-Ausschnitt der z-Achse (ganzer Hub)
 
 # Kalibrierung Poti: Spannung am unteren / oberen Anschlag und Hub dazwischen
 POTI_U_UNTEN = -4.5     # V, unterster Punkt (Motor stoppt hier selbst)
@@ -84,6 +89,13 @@ HUB_MM = 92.0           # mm zwischen den beiden Punkten
 
 GRENZE_UNTEN_STANDARD = 0.5     # mm, RUNTER wird hier abgeschaltet
 GRENZE_OBEN_STANDARD = 91.0     # mm, HOCH wird hier abgeschaltet
+
+# Position anfahren
+ZIEL_TOLERANZ = 0.05    # mm, so nah am Ziel gilt "schon da"
+NACHLAUF_S = 1.0        # s nach dem Abschalten warten, bis die Achse steht
+VORHALT_MAX = 5.0       # mm, Obergrenze fuer den gelernten Nachlauf
+POSITIONEN_DATEI = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "beamscan_positionen.json")
 
 # Datenspeicherung (nur auf Wunsch): Abstand zwischen zwei gespeicherten Zeilen
 SPEICHER_INTERVALLE = [("bei jeder Messung", 0), ("jede Sekunde", 1),
@@ -343,8 +355,9 @@ class AIWidget(QGroupBox):
         self.geraet_abfrage = geraet_abfrage     # Callable -> Geraetename
         self.hw = AIEingang()
         self.verlauf_fein = deque()     # (Zeit, mm) aller Messungen, max. 1 h
-        self.verlauf_grob = deque()     # (Zeit, mm) alle 10 s, max. 24 h
+        self.verlauf_grob = deque()     # (Zeit, mm) alle 10 s, max. 7 Tage
         self._position = None
+        self._messbeginn = None         # Zeitpunkt von "Messung starten"
 
         # --- Einstellungen ---
         self.spin_mittel = QSpinBox()
@@ -384,7 +397,7 @@ class AIWidget(QGroupBox):
         for text, sekunden in ZEITFENSTER:
             self.cmb_fenster.addItem(text, sekunden)
         self.cmb_fenster.setCurrentIndex(1)             # Default: 5 min
-        self.cmb_fenster.currentIndexChanged.connect(self._kurve_zeichnen)
+        self.cmb_fenster.currentIndexChanged.connect(self.ansicht_zuruecksetzen)
 
         self.btn_reset = QPushButton("Verlauf loeschen")
         self.btn_reset.clicked.connect(self._verlauf_loeschen)
@@ -429,7 +442,16 @@ class AIWidget(QGroupBox):
             self.linie_oben = pg.InfiniteLine(angle=0, pen=stift)
             self.plot.addItem(self.linie_unten)
             self.plot.addItem(self.linie_oben)
-            self.plot.setYRange(-2.0, HUB_MM + 2.0)
+            # Zeitachse folgt dem Zeitfenster; mit der Maus wird nur z gezoomt.
+            # Weiter als der ganze Hub laesst sich nicht herauszoomen.
+            self.plot.setMouseEnabled(x=False, y=True)
+            self.plot.setLimits(yMin=Z_ANSICHT[0] - 3.0, yMax=Z_ANSICHT[1] + 3.0,
+                                minYRange=0.05)
+            self.plot.hideButtons()
+            self.plot.setToolTip("Mausrad: z-Achse zoomen · Ziehen: verschieben\n"
+                                 "Doppelklick: Ansicht zurücksetzen")
+            self.plot.scene().sigMouseClicked.connect(self._plot_geklickt)
+            self.plot.setYRange(*Z_ANSICHT, padding=0)
             self.plot.setMinimumHeight(160)
         else:
             self.plot = QLabel("(pyqtgraph nicht installiert - keine Kurve)")
@@ -512,6 +534,7 @@ class AIWidget(QGroupBox):
             self.meldung.emit("FEHLER Positionsmessung: " + str(fehler))
             return
         self._position = None
+        self._messbeginn = time.time()
         self.spin_mittel.setEnabled(False)
         self.btn_start.setText("Messung läuft – stoppen")
         self.btn_start.setStyleSheet(zustand_stil(True, "QPushButton"))
@@ -546,6 +569,16 @@ class AIWidget(QGroupBox):
         if self.linie_unten is not None:
             self.linie_unten.setValue(self.grenze_unten)
             self.linie_oben.setValue(self.grenze_oben)
+
+    def ansicht_zuruecksetzen(self) -> None:
+        """z-Achse wieder auf den ganzen Hub, Zeitachse auf das Zeitfenster."""
+        if self.kurve is not None:
+            self.plot.setYRange(*Z_ANSICHT, padding=0)
+        self._kurve_zeichnen()
+
+    def _plot_geklickt(self, ereignis) -> None:
+        if ereignis.double():
+            self.ansicht_zuruecksetzen()
 
     def _verlauf_loeschen(self) -> None:
         self.verlauf_fein.clear()
@@ -604,7 +637,14 @@ class AIWidget(QGroupBox):
             return
         fenster = self.cmb_fenster.currentData()
         jetzt = time.time()
-        start = jetzt - fenster
+        if fenster == SEIT_MESSBEGINN:
+            beginn = self._messbeginn
+            if beginn is None:      # noch nie gemessen
+                beginn = self.verlauf_grob[0][0] if self.verlauf_grob else jetzt
+            start = min(beginn, jetzt - 60)     # mindestens 1 min breit
+            fenster = jetzt - start
+        else:
+            start = jetzt - fenster
         if fenster <= VERLAUF_FEIN_S:
             punkte = [p for p in self.verlauf_fein if p[0] >= start]
         else:
@@ -826,6 +866,229 @@ class Aufzeichnung(QGroupBox):
 
 
 # --------------------------------------------------------------------------
+# Position anfahren / Positionen merken
+# --------------------------------------------------------------------------
+class PositionAnfahren(QGroupBox):
+    """Zielposition eingeben oder gemerkte Position waehlen und anfahren.
+
+    Gemerkte Positionen und der gelernte Nachlauf werden in
+    POSITIONEN_DATEI gespeichert und beim naechsten Start wieder geladen.
+    """
+
+    anfahren = pyqtSignal(float, str)   # Ziel [mm], Name (oder "")
+    abbrechen = pyqtSignal()
+    meldung = pyqtSignal(str)
+
+    def __init__(self, position_abfrage):
+        super().__init__("Position anfahren")
+        self.position_abfrage = position_abfrage    # Callable -> mm oder None
+        self.positionen = []                # [(Name, mm)], nach mm sortiert
+        self.vorhalt = [0.0, 0.0]           # gelernter Nachlauf HOCH / RUNTER
+        self._laeuft = False
+        self._laden()
+
+        self.spin_ziel = QDoubleSpinBox()
+        self.spin_ziel.setRange(0.0, HUB_MM)
+        self.spin_ziel.setDecimals(2)
+        self.spin_ziel.setSingleStep(0.1)
+        self.spin_ziel.setSuffix(" mm")
+        self.spin_ziel.setValue(HUB_MM / 2)
+
+        self.btn_fahren = QPushButton("Anfahren")
+        self.btn_fahren.setMinimumWidth(140)
+        self.btn_fahren.clicked.connect(self._fahren_geklickt)
+
+        self.lbl_status = QLabel("")
+
+        self.cmb_gemerkt = QComboBox()
+        self.cmb_gemerkt.setPlaceholderText("– gemerkte Position wählen –")
+        self.cmb_gemerkt.setMinimumWidth(220)
+        self.cmb_gemerkt.currentIndexChanged.connect(self._gemerkt_gewaehlt)
+
+        # faehrt die in der Liste gewaehlte Position direkt an
+        self.btn_gemerkt_fahren = QPushButton("Anfahren")
+        self.btn_gemerkt_fahren.setMinimumWidth(140)
+        self.btn_gemerkt_fahren.clicked.connect(self._gemerkt_fahren)
+
+        self._erlaubt = False
+        self._grund = ""
+
+        self.btn_merken = QPushButton("Aktuelle Position merken …")
+        self.btn_merken.clicked.connect(self._merken)
+        self.btn_loeschen = QPushButton("Löschen")
+        self.btn_loeschen.clicked.connect(self._loeschen)
+
+        self.lbl_nachlauf = QLabel()
+        self.lbl_nachlauf.setStyleSheet("color: #666666;")
+        self.lbl_nachlauf.setToolTip(
+            "Der Motor läuft nach dem Abschalten noch ein Stück weiter.\n"
+            "Dieser Nachlauf wird bei jeder Anfahrt gemessen und gelernt;\n"
+            "abgeschaltet wird entsprechend früher.")
+
+        raster = QGridLayout(self)
+        raster.addWidget(QLabel("Ziel:"), 0, 0)
+        raster.addWidget(self.spin_ziel, 0, 1)
+        raster.addWidget(self.btn_fahren, 0, 2)
+        raster.addWidget(self.lbl_status, 0, 3, 1, 3)
+        raster.addWidget(QLabel("Gemerkt:"), 1, 0)
+        raster.addWidget(self.cmb_gemerkt, 1, 1)
+        raster.addWidget(self.btn_gemerkt_fahren, 1, 2)
+        raster.addWidget(self.btn_merken, 1, 3)
+        raster.addWidget(self.btn_loeschen, 1, 4)
+        raster.addWidget(self.lbl_nachlauf, 1, 5)
+        raster.setColumnStretch(5, 1)
+
+        self._liste_fuellen()
+        self._nachlauf_anzeigen()
+        self.zustand_setzen(False, False, "nicht verbunden")
+
+    # -- Zustand von aussen ------------------------------------------------
+    def zustand_setzen(self, laeuft: bool, erlaubt: bool, grund: str = "") -> None:
+        """laeuft: Anfahrt aktiv. erlaubt: eine neue Anfahrt ist moeglich."""
+        self._laeuft = laeuft
+        self._erlaubt = erlaubt
+        self._grund = grund
+        self._knoepfe_setzen()
+        self.spin_ziel.setEnabled(not laeuft)
+        self.cmb_gemerkt.setEnabled(not laeuft and bool(self.positionen))
+        self.btn_merken.setEnabled(self.position_abfrage() is not None)
+        self.btn_merken.setToolTip(
+            "" if self.btn_merken.isEnabled() else "erst Positionsmessung starten")
+        self.btn_loeschen.setEnabled(
+            not laeuft and self.cmb_gemerkt.currentIndex() >= 0)
+
+    def status(self, text: str, farbe: str = "#333333") -> None:
+        self.lbl_status.setText(text)
+        self.lbl_status.setStyleSheet("color: " + farbe + ";")
+
+    def vorhalt_lernen(self, index: int, nachlauf: float) -> None:
+        """Gemessenen Nachlauf (mm, in Fahrtrichtung) einrechnen."""
+        neu = 0.5 * self.vorhalt[index] + 0.5 * nachlauf
+        self.vorhalt[index] = min(max(neu, 0.0), VORHALT_MAX)
+        self._nachlauf_anzeigen()
+        self._speichern()
+
+    # -- Bedienung ---------------------------------------------------------
+    def _fahren_geklickt(self) -> None:
+        if self._laeuft:
+            self.abbrechen.emit()
+            return
+        ziel = round(self.spin_ziel.value(), 2)
+        name = ""
+        i = self.cmb_gemerkt.currentIndex()
+        if i >= 0 and abs(self.positionen[i][1] - ziel) < 0.005:
+            name = self.positionen[i][0]
+        self.anfahren.emit(ziel, name)
+
+    def _gemerkt_fahren(self) -> None:
+        if self._laeuft:
+            self.abbrechen.emit()
+            return
+        i = self.cmb_gemerkt.currentIndex()
+        if 0 <= i < len(self.positionen):
+            name, mm = self.positionen[i]
+            self.spin_ziel.setValue(mm)
+            self.anfahren.emit(mm, name)
+
+    def _gemerkt_gewaehlt(self, i: int) -> None:
+        if 0 <= i < len(self.positionen):
+            self.spin_ziel.setValue(self.positionen[i][1])
+        self.btn_loeschen.setEnabled(not self._laeuft and i >= 0)
+        self._knoepfe_setzen()
+
+    def _knoepfe_setzen(self) -> None:
+        """Beide Anfahren-Knoepfe; waehrend einer Anfahrt = abbrechen."""
+        gewaehlt = self.cmb_gemerkt.currentIndex() >= 0
+        for btn, moeglich, grund in (
+                (self.btn_fahren, self._erlaubt, self._grund),
+                (self.btn_gemerkt_fahren, self._erlaubt and gewaehlt,
+                 self._grund if not self._erlaubt
+                 else "erst eine gemerkte Position wählen")):
+            if self._laeuft:
+                btn.setText("Anfahrt abbrechen")
+                btn.setEnabled(True)
+                btn.setToolTip("")
+            else:
+                btn.setText("Anfahren")
+                btn.setEnabled(moeglich)
+                btn.setToolTip("" if moeglich else "gesperrt: " + grund)
+
+    def _merken(self) -> None:
+        pos = self.position_abfrage()
+        if pos is None:
+            return
+        pos = round(pos, 2)
+        vorschlag = "Position " + str(len(self.positionen) + 1)
+        name, ok = QInputDialog.getText(
+            self, "Position merken",
+            "Name für z = " + _zahl(pos, 2) + " mm:", text=vorschlag)
+        name = name.strip()
+        if not ok or not name:
+            return
+        ersetzt = any(n == name for n, _ in self.positionen)
+        self.positionen = [(n, mm) for n, mm in self.positionen if n != name]
+        self.positionen.append((name, pos))
+        self.positionen.sort(key=lambda p: p[1])
+        self._speichern()
+        self._liste_fuellen(name)
+        self.meldung.emit("Position {} „{}“: {} mm".format(
+            "aktualisiert" if ersetzt else "gemerkt", name, _zahl(pos, 2)))
+
+    def _loeschen(self) -> None:
+        i = self.cmb_gemerkt.currentIndex()
+        if not 0 <= i < len(self.positionen):
+            return
+        name, mm = self.positionen.pop(i)
+        self._speichern()
+        self._liste_fuellen()
+        self.meldung.emit("Gemerkte Position gelöscht: „{}“ ({} mm)".format(
+            name, _zahl(mm, 2)))
+
+    # -- intern ------------------------------------------------------------
+    def _liste_fuellen(self, auswahl: str = "") -> None:
+        self.cmb_gemerkt.clear()
+        for name, mm in self.positionen:
+            self.cmb_gemerkt.addItem("{}  ({} mm)".format(name, _zahl(mm, 2)))
+        index = next((i for i, (n, _) in enumerate(self.positionen)
+                      if n == auswahl), -1)
+        self.cmb_gemerkt.setCurrentIndex(index)
+        self.cmb_gemerkt.setEnabled(not self._laeuft and bool(self.positionen))
+        self.btn_loeschen.setEnabled(not self._laeuft and index >= 0)
+
+    def _nachlauf_anzeigen(self) -> None:
+        self.lbl_nachlauf.setText(
+            "Nachlauf: hoch {} mm · runter {} mm".format(
+                _zahl(self.vorhalt[KANAL_HOCH], 2),
+                _zahl(self.vorhalt[KANAL_RUNTER], 2)))
+
+    def _laden(self) -> None:
+        try:
+            with open(POSITIONEN_DATEI, encoding="utf-8") as datei:
+                daten = json.load(datei)
+            self.positionen = sorted(
+                ((str(p["name"]), float(p["mm"])) for p in daten["positionen"]),
+                key=lambda p: p[1])
+            self.vorhalt = [min(max(float(v), 0.0), VORHALT_MAX)
+                            for v in daten.get("nachlauf_mm", [0.0, 0.0])][:2]
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError, KeyError, TypeError):
+            self.positionen = []
+            self.vorhalt = [0.0, 0.0]
+
+    def _speichern(self) -> None:
+        daten = {
+            "positionen": [{"name": n, "mm": mm} for n, mm in self.positionen],
+            "nachlauf_mm": self.vorhalt,
+        }
+        try:
+            with open(POSITIONEN_DATEI, "w", encoding="utf-8") as datei:
+                json.dump(daten, datei, ensure_ascii=False, indent=2)
+        except OSError as fehler:
+            self.meldung.emit("FEHLER Positionen speichern: " + str(fehler))
+
+
+# --------------------------------------------------------------------------
 # Hauptfenster
 # --------------------------------------------------------------------------
 class Hauptfenster(QWidget):
@@ -836,6 +1099,8 @@ class Hauptfenster(QWidget):
         self.hw = AOAusgang()
         self._vorher = [0.0, 0.0]           # zuletzt ausgegebene Spannungen
         self._stopp_grund = [None, None]    # Grund fuer automatischen Stopp
+        self._anfahrt = None                # laufende Anfahrt (dict) oder None
+        self._messung_nr = 0                # zaehlt neue Positionsmessungen
 
         # Kopfzeile: Geraetewahl + Verbindung
         self.cmb_geraet = QComboBox()
@@ -866,6 +1131,19 @@ class Hauptfenster(QWidget):
         for kanal in self.kanaele:
             kanalzeile.addWidget(kanal)
 
+        # Endlagen-Fahrt: schaltet die Richtung ein, gestoppt wird automatisch
+        # an "Stopp oben/unten bei" (bzw. unten am mechanischen Endschalter)
+        self.btn_ganz_oben = QPushButton("▲  Ganz nach oben")
+        self.btn_ganz_unten = QPushButton("▼  Ganz nach unten")
+        endlagen = QHBoxLayout()
+        for btn, kanal, ziel in ((self.btn_ganz_oben, self.kanal_hoch, "oben"),
+                                 (self.btn_ganz_unten, self.kanal_runter, "unten")):
+            btn.setMinimumHeight(36)
+            btn.setStyleSheet("QPushButton { font-weight: bold; font-size: 13px; }")
+            btn.clicked.connect(
+                lambda _=False, k=kanal, z=ziel: self._endlage_fahren(k, z))
+            endlagen.addWidget(btn)
+
         # NOT-AUS
         self.btn_notaus = QPushButton("NOT-AUS  -  Motor stopp, beide Ausgaenge auf 0 V")
         self.btn_notaus.setMinimumHeight(48)
@@ -879,6 +1157,12 @@ class Hauptfenster(QWidget):
         self.ai_widget = AIWidget(self.cmb_geraet.currentText)
         self.ai_widget.meldung.connect(self._melden)
         self.ai_widget.zustand.connect(self._position_geaendert)
+
+        # Position anfahren / merken
+        self.anfahren = PositionAnfahren(lambda: self.ai_widget.position_mm)
+        self.anfahren.anfahren.connect(self._anfahrt_starten)
+        self.anfahren.abbrechen.connect(self._anfahrt_abbrechen)
+        self.anfahren.meldung.connect(self._melden)
 
         # Datenspeicherung (aus, bis man sie startet)
         self.aufzeichnung = Aufzeichnung()
@@ -895,6 +1179,8 @@ class Hauptfenster(QWidget):
         layout = QVBoxLayout(self)
         layout.addLayout(kopf)
         layout.addLayout(kanalzeile)
+        layout.addLayout(endlagen)
+        layout.addWidget(self.anfahren)
         layout.addWidget(self.btn_notaus)
         layout.addWidget(self.ai_widget, 1)
         layout.addWidget(self.aufzeichnung)
@@ -971,7 +1257,7 @@ class Hauptfenster(QWidget):
         pos = self.ai_widget.position_mm
         oben = self.ai_widget.grenze_oben
         unten = self.ai_widget.grenze_unten
-        geaendert = False
+        geaendert = self._anfahrt_pruefen()
 
         if hoch.freigegeben and runter.freigegeben:
             self._still_sperren(hoch)
@@ -979,12 +1265,8 @@ class Hauptfenster(QWidget):
             self._stopp_grund = ["Verriegelung", "Verriegelung"]
             geaendert = True
 
-        if hoch.freigegeben:
-            if pos is None:
-                self._still_sperren(hoch)
-                self._stopp_grund[KANAL_HOCH] = "Positionsmessung aus"
-                geaendert = True
-            elif pos >= oben:
+        if hoch.freigegeben and pos is not None:
+            if pos >= oben:
                 self._still_sperren(hoch)
                 self._stopp_grund[KANAL_HOCH] = (
                     "obere Grenze " + _zahl(oben, 1) + " mm erreicht")
@@ -999,9 +1281,7 @@ class Hauptfenster(QWidget):
         # Welche Freigaben sind im Moment ueberhaupt moeglich?
         if runter.freigegeben:
             hoch.freigabe_erlauben(False, "RUNTER ist aktiv")
-        elif pos is None:
-            hoch.freigabe_erlauben(False, "erst Positionsmessung starten")
-        elif pos >= oben:
+        elif pos is not None and pos >= oben:
             hoch.freigabe_erlauben(False, "obere Grenze erreicht")
         else:
             hoch.freigabe_erlauben(True)
@@ -1013,9 +1293,147 @@ class Hauptfenster(QWidget):
         else:
             runter.freigabe_erlauben(True)
 
+        self._endlagen_knoepfe_aktualisieren()
+        self._anfahren_aktualisieren()
         return geaendert
 
+    def _endlagen_knoepfe_aktualisieren(self) -> None:
+        """Knoepfe nur bedienbar, wenn die Richtung gerade eingeschaltet werden darf."""
+        oben = _zahl(self.ai_widget.grenze_oben, 1)
+        unten = _zahl(self.ai_widget.grenze_unten, 1)
+        for btn, kanal, tipp in (
+                (self.btn_ganz_oben, self.kanal_hoch,
+                 "HOCH mit dem Sollwert von ao0 einschalten.\n"
+                 "Stoppt automatisch bei " + oben + " mm (Stopp oben bei)."),
+                (self.btn_ganz_unten, self.kanal_runter,
+                 "RUNTER mit dem Sollwert von ao1 einschalten.\n"
+                 "Stoppt automatisch bei " + unten + " mm (Stopp unten bei),\n"
+                 "ohne Positionsmessung am mechanischen Endschalter.")):
+            erlaubt = kanal.chk_frei.isEnabled() and not kanal.freigegeben
+            grund = kanal.lbl_hinweis.text()
+            if kanal is self.kanal_hoch and self.ai_widget.position_mm is None:
+                # ohne Messung gaebe es oben keinen automatischen Stopp
+                erlaubt = False
+                grund = "erst Positionsmessung starten"
+            btn.setEnabled(erlaubt)
+            btn.setToolTip(tipp if erlaubt or not grund else grund)
+
+    def _endlage_fahren(self, kanal: KanalWidget, ziel: str) -> None:
+        if not kanal.chk_frei.isEnabled() or kanal.freigegeben:
+            return
+        if kanal is self.kanal_hoch and self.ai_widget.position_mm is None:
+            return
+        self._melden("Fahrt ganz nach " + ziel)
+        kanal.chk_frei.setChecked(True)
+
+    # -- Position anfahren --------------------------------------------------
+    def _anfahrt_starten(self, ziel: float, name: str) -> None:
+        if self._anfahrt is not None:
+            return
+        pos = self.ai_widget.position_mm
+        unten, oben = self.ai_widget.grenze_unten, self.ai_widget.grenze_oben
+        if pos is None or not self.hw.verbunden:
+            return
+        if not unten <= ziel <= oben:
+            self.anfahren.status(
+                "Ziel liegt außerhalb der Stopp-Grenzen ({} … {} mm)".format(
+                    _zahl(unten, 1), _zahl(oben, 1)), "#c0392b")
+            return
+        ziel_text = _zahl(ziel, 2) + " mm" + (" („" + name + "“)" if name else "")
+        if abs(ziel - pos) <= ZIEL_TOLERANZ:
+            self.anfahren.status("steht bereits auf " + _zahl(pos, 2) + " mm",
+                                 "#2d7d46")
+            return
+        index = KANAL_HOCH if ziel > pos else KANAL_RUNTER
+        kanal = self.kanaele[index]
+        if not kanal.chk_frei.isEnabled() or kanal.freigegeben:
+            return
+        self._anfahrt = {"ziel": ziel, "text": ziel_text, "index": index,
+                         "phase": "fahren", "stopp_pos": None, "stopp_zeit": None}
+        self._melden("Anfahren: " + ziel_text)
+        self.anfahren.status("fährt auf " + _zahl(ziel, 2) + " mm …", "#c0392b")
+        kanal.chk_frei.setChecked(True)
+
+    def _anfahrt_abbrechen(self) -> None:
+        a = self._anfahrt
+        if a is None or a["phase"] != "fahren":
+            return
+        self._anfahrt = None
+        self._still_sperren(self.kanaele[a["index"]])
+        self._stopp_grund[a["index"]] = "Anfahrt abgebrochen"
+        self.anfahren.status("abgebrochen", "#b9770e")
+        self._ausgeben()
+
+    def _anfahrt_pruefen(self) -> bool:
+        """Ziel erreicht? Dann abschalten. Liefert True, wenn gestoppt wurde."""
+        a = self._anfahrt
+        if a is None:
+            return False
+        pos = self.ai_widget.position_mm
+        kanal = self.kanaele[a["index"]]
+        richtung = 1.0 if a["index"] == KANAL_HOCH else -1.0
+
+        if a["phase"] == "fahren":
+            if not kanal.freigegeben:
+                # von aussen gestoppt: NOT-AUS, Haken, Grenze, Trennen ...
+                self._anfahrt = None
+                self._melden("Anfahrt abgebrochen: " + a["text"])
+                self.anfahren.status("abgebrochen", "#b9770e")
+                return False
+            if pos is None:
+                self._anfahrt = None
+                self._still_sperren(kanal)
+                self._stopp_grund[a["index"]] = "Positionsmessung aus"
+                self.anfahren.status("abgebrochen: Messung aus", "#b9770e")
+                return True
+            vorhalt = self.anfahren.vorhalt[a["index"]]
+            if (pos - a["ziel"]) * richtung >= -vorhalt:
+                self._still_sperren(kanal)
+                self._stopp_grund[a["index"]] = "Ziel " + a["text"]
+                a.update(phase="nachlauf", stopp_pos=pos,
+                         stopp_zeit=time.monotonic(),
+                         stopp_nr=self._messung_nr)
+                self.anfahren.status("Ziel erreicht, Achse läuft aus …",
+                                     "#b9770e")
+                return True
+            return False
+
+        # Nachlauf: warten, bis die Achse steht, dann Ergebnis melden
+        if pos is None:
+            self._anfahrt = None
+            self.anfahren.status("")
+            return False
+        # erst mit einer spaeteren Messung und nach NACHLAUF_S auswerten
+        if (self._messung_nr <= a["stopp_nr"]
+                or time.monotonic() - a["stopp_zeit"] < NACHLAUF_S):
+            return False
+        self._anfahrt = None
+        abweichung = pos - a["ziel"]
+        self.anfahren.vorhalt_lernen(
+            a["index"], (pos - a["stopp_pos"]) * richtung)
+        ergebnis = "z = {} mm (Abweichung {} mm)".format(
+            _zahl(pos, 2), ("+" if abweichung >= 0 else "") + _zahl(abweichung, 2))
+        self._melden("Ziel " + a["text"] + " erreicht: " + ergebnis)
+        self.anfahren.status("erreicht: " + ergebnis, "#2d7d46")
+        return False
+
+    def _anfahren_aktualisieren(self) -> None:
+        a = self._anfahrt
+        if not self.hw.verbunden:
+            erlaubt, grund = False, "nicht verbunden"
+        elif self.ai_widget.position_mm is None:
+            erlaubt, grund = False, "erst Positionsmessung starten"
+        elif a is not None:
+            erlaubt, grund = False, "Achse läuft noch aus"
+        elif any(k.freigegeben for k in self.kanaele):
+            erlaubt, grund = False, "Motor läuft – erst stoppen"
+        else:
+            erlaubt, grund = True, ""
+        laeuft = a is not None and a["phase"] == "fahren"
+        self.anfahren.zustand_setzen(laeuft, erlaubt, grund)
+
     def _position_geaendert(self) -> None:
+        self._messung_nr += 1
         if self._sicherheit_pruefen():
             self._ausgeben()
 

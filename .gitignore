@@ -2,3 +2,5 @@ __pycache__/
 *.pyc
 # Messdaten-Aufzeichnungen nicht versionieren
 *.csv
+# lokale Einstellungen (gemerkte Positionen, Nachlauf)
+beamscan_positionen.json
